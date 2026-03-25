@@ -1,0 +1,500 @@
+#!/usr/bin/env python3
+"""
+code_chat.py — Pro LLM CLI for chatting about your code.
+
+Features:
+  - Streaming responses
+  - Real token counting via tiktoken
+  - Session persistence (~/.cache/code_chat/)
+  - .gitignore-aware file walking
+  - .env support
+  - Skill generation: compress your codebase into a reusable ~2k-token map
+
+Install:
+  pip install openai tiktoken python-dotenv pathspec
+
+Usage:
+  python code_chat.py [file_or_dir ...]
+  python code_chat.py --session my_project
+"""
+
+import os
+import sys
+import json
+import textwrap
+import argparse
+import datetime
+from pathlib import Path
+
+# ── Optional deps with graceful fallbacks ─────────────────────────────────────
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # .env support optional
+
+try:
+    import tiktoken
+    _enc = tiktoken.encoding_for_model("gpt-4o")
+    def count_tokens(text: str) -> int:
+        return len(_enc.encode(text))
+except ImportError:
+    print("  [warn] tiktoken not installed — using char estimate. `pip install tiktoken` for accuracy.")
+    def count_tokens(text: str) -> int:
+        return max(1, len(text) // 4)
+
+try:
+    import pathspec
+    _HAS_PATHSPEC = True
+except ImportError:
+    _HAS_PATHSPEC = False
+
+from openai import OpenAI
+
+# ── Config ────────────────────────────────────────────────────────────────────
+MODEL            = os.environ.get("CODE_CHAT_MODEL", "gpt-4o")
+MAX_TOKENS       = int(os.environ.get("CODE_CHAT_MAX_TOKENS", 128_000))
+WARN_THRESHOLD   = float(os.environ.get("CODE_CHAT_WARN_AT", 0.80))
+RESPONSE_RESERVE = 2_048
+
+CACHE_DIR  = Path.home() / ".cache" / "code_chat"
+SKILL_EXT  = ".skill.md"
+
+SKIP_DIRS = {
+    ".git", "__pycache__", "node_modules", ".venv", "venv",
+    ".mypy_cache", "dist", "build", ".next", ".nuxt", "coverage",
+    ".pytest_cache", ".tox", "eggs", ".eggs",
+}
+SKIP_EXTS = {
+    ".pyc", ".pyo", ".pyd", ".so", ".dll", ".exe", ".bin",
+    ".jpg", ".jpeg", ".png", ".gif", ".svg", ".ico", ".webp",
+    ".zip", ".tar", ".gz", ".bz2", ".lock", ".map", ".min.js",
+    ".woff", ".woff2", ".ttf", ".eot",
+}
+
+# ── Token display ─────────────────────────────────────────────────────────────
+def token_bar(used: int, total: int) -> str:
+    pct   = used / total
+    filled = int(pct * 24)
+    bar   = "█" * filled + "░" * (24 - filled)
+    color = "\033[33m" if pct >= WARN_THRESHOLD else "\033[32m"
+    reset = "\033[0m"
+    warn  = "  ⚠ nearing limit — consider /reset" if pct >= WARN_THRESHOLD else ""
+    return f"  {color}[{bar}]{reset} {used:,} / {total:,} tokens  ({pct*100:.0f}%){warn}"
+
+def history_tokens(history: list[dict]) -> int:
+    return sum(count_tokens(m["content"]) for m in history)
+
+# ── .gitignore parsing ────────────────────────────────────────────────────────
+def load_gitignore(root: str):
+    gi_path = os.path.join(root, ".gitignore")
+    if _HAS_PATHSPEC and os.path.isfile(gi_path):
+        with open(gi_path) as f:
+            return pathspec.PathSpec.from_lines("gitwildmatch", f)
+    return None
+
+def is_ignored(spec, root: str, path: str) -> bool:
+    if spec is None:
+        return False
+    rel = os.path.relpath(path, root)
+    return spec.match_file(rel)
+
+# ── File loading ──────────────────────────────────────────────────────────────
+def load_code_context(paths: list[str]) -> tuple[str, list[str]]:
+    """Return (formatted context string, list of loaded file paths)."""
+    blocks, loaded = [], []
+    for path in paths:
+        root = path if os.path.isdir(path) else os.path.dirname(path) or "."
+        spec = load_gitignore(root)
+        if os.path.isfile(path):
+            _read_file(path, blocks, loaded, spec, root)
+        elif os.path.isdir(path):
+            for dirroot, dirs, files in os.walk(path):
+                dirs[:] = sorted([
+                    d for d in dirs
+                    if d not in SKIP_DIRS
+                    and not is_ignored(spec, path, os.path.join(dirroot, d))
+                ])
+                for fname in sorted(files):
+                    fpath = os.path.join(dirroot, fname)
+                    _read_file(fpath, blocks, loaded, spec, path)
+        else:
+            print(f"  \033[31m[!]\033[0m Path not found: {path}")
+    return "\n\n".join(blocks), loaded
+
+def _read_file(fpath: str, blocks: list, loaded: list, spec, root: str):
+    if any(fpath.endswith(ext) for ext in SKIP_EXTS):
+        return
+    if is_ignored(spec, root, fpath):
+        return
+    try:
+        with open(fpath, encoding="utf-8", errors="ignore") as f:
+            content = f.read()
+        if content.strip():
+            ext = os.path.splitext(fpath)[1].lstrip(".")
+            blocks.append(f"### {fpath}\n```{ext}\n{content}\n```")
+            loaded.append(fpath)
+    except Exception as e:
+        print(f"  \033[31m[!]\033[0m Could not read {fpath}: {e}")
+
+# ── Session persistence ───────────────────────────────────────────────────────
+def session_path(name: str) -> Path:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    return CACHE_DIR / f"{name}.json"
+
+def save_session(name: str, history: list[dict], loaded_files: list[str]):
+    data = {
+        "saved_at":    datetime.datetime.now().isoformat(),
+        "model":       MODEL,
+        "history":     history,
+        "loaded_files": loaded_files,
+    }
+    with open(session_path(name), "w") as f:
+        json.dump(data, f, indent=2)
+
+def load_session(name: str) -> tuple[list[dict], list[str]]:
+    p = session_path(name)
+    if not p.exists():
+        return [], []
+    with open(p) as f:
+        data = json.load(f)
+    saved_at = data.get("saved_at", "unknown")
+    print(f"  \033[36m✓\033[0m Resumed session '{name}' (saved {saved_at})")
+    return data.get("history", []), data.get("loaded_files", [])
+
+def list_sessions() -> list[str]:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    return sorted(p.stem for p in CACHE_DIR.glob("*.json"))
+
+# ── Skill generation ──────────────────────────────────────────────────────────
+SKILL_PROMPT = textwrap.dedent("""\
+    You are a senior software architect. Analyze the codebase above and produce a
+    structured "skill document" — a compact map an LLM can load instead of the raw
+    code to understand the project's structure.
+
+    Format your response as markdown with exactly these sections:
+
+    ## Overview
+    One paragraph: what this project does, its domain, tech stack.
+
+    ## Architecture
+    How the system is structured (layers, services, modules). Include a simple
+    ASCII diagram if helpful.
+
+    ## Key Files & Roles
+    A table: | File | Role | Key exports/classes/functions |
+
+    ## Data Flow
+    How data enters, transforms, and exits the system (request lifecycle, pipelines, etc.)
+
+    ## Patterns & Conventions
+    Coding patterns used (e.g. dependency injection, factory pattern, async style,
+    naming conventions, error handling approach).
+
+    ## External Dependencies
+    Key libraries and what they're used for (exclude dev/test tools unless important).
+
+    ## Gotchas & Non-obvious Decisions
+    Things a new developer (or LLM) would likely misunderstand or miss.
+
+    Be concise. The entire document must be under 1500 tokens.
+""")
+
+def generate_skill(client: OpenAI, paths: list[str], out_path: str | None = None) -> str | None:
+    print("\n  \033[36m⚙\033[0m  Reading codebase for skill generation…")
+    context, loaded = load_code_context(paths)
+    if not loaded:
+        print("  \033[31m[!]\033[0m No files loaded — skill not generated.")
+        return None
+
+    tokens = count_tokens(context)
+    print(f"  \033[36m⚙\033[0m  Ingested {len(loaded)} files ({tokens:,} tokens). Generating skill…\n")
+
+    messages = [
+        {"role": "user", "content": f"Here is my codebase:\n\n{context}\n\n{SKILL_PROMPT}"}
+    ]
+
+    skill_text = ""
+    print("  \033[35mskill>\033[0m ", end="", flush=True)
+    with client.chat.completions.create(
+        model=MODEL,
+        max_tokens=1800,
+        messages=messages,
+        stream=True,
+    ) as stream:
+        for chunk in stream:
+            delta = chunk.choices[0].delta.content or ""
+            print(delta, end="", flush=True)
+            skill_text += delta
+    print("\n")
+
+    # Save to disk
+    if out_path is None:
+        # Derive from first path
+        base = os.path.basename(os.path.abspath(paths[0]).rstrip("/"))
+        out_path = f"{base}{SKILL_EXT}"
+
+    with open(out_path, "w") as f:
+        header = f"<!-- skill generated {datetime.datetime.now().isoformat()} -->\n"
+        f.write(header + skill_text)
+
+    print(f"  \033[32m✓\033[0m  Skill saved to: \033[1m{out_path}\033[0m")
+    print(f"       Load in future sessions with: \033[1m/skill load {out_path}\033[0m\n")
+    return out_path
+
+# ── Chat (streaming) ──────────────────────────────────────────────────────────
+def chat_stream(client: OpenAI, history: list[dict], user_input: str) -> str:
+    history.append({"role": "user", "content": user_input})
+    full_reply = ""
+    print("\n\033[36mllm>\033[0m ", end="", flush=True)
+    with client.chat.completions.create(
+        model=MODEL,
+        max_tokens=RESPONSE_RESERVE,
+        messages=history,
+        stream=True,
+    ) as stream:
+        for chunk in stream:
+            delta = chunk.choices[0].delta.content or ""
+            print(delta, end="", flush=True)
+            full_reply += delta
+    print("\n")
+    history.append({"role": "assistant", "content": full_reply})
+    return full_reply
+
+def ingest(history: list[dict], loaded_files: list[str], paths: list[str]) -> list[str]:
+    """Load code into history, deduplicating files already present."""
+    context, new_files = load_code_context(paths)
+    dupes = [f for f in new_files if f in loaded_files]
+    fresh = [f for f in new_files if f not in loaded_files]
+
+    if dupes:
+        print(f"  \033[33m[~]\033[0m Skipped {len(dupes)} already-loaded file(s).")
+    if not fresh:
+        print("  \033[33m[!]\033[0m No new files to load.")
+        return []
+
+    # Rebuild context with only fresh files
+    fresh_context, _ = load_code_context(fresh)
+    history.append({"role": "user",      "content": f"Here is my current codebase:\n\n{fresh_context}"})
+    history.append({"role": "assistant", "content": "Got it — I've read your code. What would you like to know?"})
+    return fresh
+
+# ── Help ──────────────────────────────────────────────────────────────────────
+HELP = textwrap.dedent("""\
+  \033[1mCommands\033[0m
+    /load <path> [...]        Ingest files or dirs (deduplication-safe)
+    /reset                    Clear all history and start fresh
+    /reset <path> [...]       Clear history then immediately load paths
+
+    /skill gen <path> [...]   Analyze code → generate a compact .skill.md map
+    /skill load <file.skill.md>  Load a skill file into context (cheap: ~1k tokens)
+
+    /session save [name]      Save current session to disk
+    /session load <name>      Resume a saved session
+    /session list             List saved sessions
+    /session clear <name>     Delete a saved session
+
+    /tokens                   Show token usage bar
+    /files                    List currently loaded files
+    /model [name]             Show or change the model
+    /help                     Show this message
+    /quit  /exit              Exit (auto-saves session as 'last')
+""")
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+def main():
+    parser = argparse.ArgumentParser(description="LLM code chat CLI", add_help=False)
+    parser.add_argument("paths", nargs="*", help="Files or dirs to load at startup")
+    parser.add_argument("--session", "-s", default="last", help="Session name to resume")
+    args = parser.parse_args()
+
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        print("\033[31mError:\033[0m OPENAI_API_KEY not set. Add it to your .env or environment.")
+        sys.exit(1)
+
+    client = OpenAI(api_key=api_key)
+
+    # Resume session
+    history, loaded_files = load_session(args.session)
+
+    print("\n\033[1m╔════════════════════════════════════════╗\033[0m")
+    print("\033[1m║         code_chat  ·  pro edition      ║\033[0m")
+    print("\033[1m╚════════════════════════════════════════╝\033[0m")
+    print(f"  Model   : \033[1m{MODEL}\033[0m")
+    print(f"  Session : \033[1m{args.session}\033[0m")
+    print(f"  /help for commands\n")
+
+    # Load startup paths
+    if args.paths:
+        print(f"  Loading {len(args.paths)} path(s)…")
+        new = ingest(history, loaded_files, args.paths)
+        loaded_files.extend(new)
+        for f in new:
+            print(f"    \033[32m✓\033[0m {f}")
+        print(f"\n{token_bar(history_tokens(history), MAX_TOKENS)}\n")
+
+    session_name = args.session
+
+    while True:
+        try:
+            user_input = input("\033[1myou>\033[0m ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n  Auto-saving session…")
+            save_session(session_name, history, loaded_files)
+            print(f"  \033[32m✓\033[0m Saved as '{session_name}'. Bye!")
+            break
+
+        if not user_input:
+            continue
+
+        if user_input.startswith("/"):
+            parts = user_input.split()
+            cmd   = parts[0].lower()
+
+            # ── /quit /exit ───────────────────────────────────────────────────
+            if cmd in ("/quit", "/exit"):
+                save_session(session_name, history, loaded_files)
+                print(f"  \033[32m✓\033[0m Session saved as '{session_name}'. Bye!")
+                break
+
+            # ── /help ─────────────────────────────────────────────────────────
+            elif cmd == "/help":
+                print(HELP)
+
+            # ── /tokens ───────────────────────────────────────────────────────
+            elif cmd == "/tokens":
+                print(f"\n{token_bar(history_tokens(history), MAX_TOKENS)}\n")
+
+            # ── /files ────────────────────────────────────────────────────────
+            elif cmd == "/files":
+                if loaded_files:
+                    print("\n  Loaded files:")
+                    for f in loaded_files:
+                        print(f"    • {f}")
+                else:
+                    print("  No files loaded yet.")
+                print()
+
+            # ── /model ────────────────────────────────────────────────────────
+            elif cmd == "/model":
+                global MODEL
+                if len(parts) > 1:
+                    MODEL = parts[1]
+                    print(f"  \033[32m✓\033[0m Model set to: \033[1m{MODEL}\033[0m\n")
+                else:
+                    print(f"  Current model: \033[1m{MODEL}\033[0m\n")
+
+            # ── /reset ────────────────────────────────────────────────────────
+            elif cmd == "/reset":
+                history.clear()
+                loaded_files.clear()
+                print("  \033[32m✓\033[0m History cleared.\n")
+                if len(parts) > 1:
+                    new = ingest(history, loaded_files, parts[1:])
+                    loaded_files.extend(new)
+                    for f in new:
+                        print(f"    \033[32m✓\033[0m {f}")
+                    print(f"\n{token_bar(history_tokens(history), MAX_TOKENS)}\n")
+
+            # ── /load ─────────────────────────────────────────────────────────
+            elif cmd == "/load":
+                if len(parts) < 2:
+                    print("  Usage: /load <path> [path2 ...]\n")
+                else:
+                    new = ingest(history, loaded_files, parts[1:])
+                    loaded_files.extend(new)
+                    for f in new:
+                        print(f"    \033[32m✓\033[0m {f}")
+                    print(f"\n{token_bar(history_tokens(history), MAX_TOKENS)}\n")
+
+            # ── /skill ────────────────────────────────────────────────────────
+            elif cmd == "/skill":
+                if len(parts) < 2:
+                    print("  Usage: /skill gen <path> [...]  |  /skill load <file.skill.md>\n")
+                elif parts[1].lower() == "gen":
+                    if len(parts) < 3:
+                        print("  Usage: /skill gen <path> [path2 ...]\n")
+                    else:
+                        generate_skill(client, parts[2:])
+                elif parts[1].lower() == "load":
+                    if len(parts) < 3:
+                        print("  Usage: /skill load <file.skill.md>\n")
+                    else:
+                        skill_file = parts[2]
+                        new = ingest(history, loaded_files, [skill_file])
+                        loaded_files.extend(new)
+                        if new:
+                            toks = count_tokens(open(skill_file).read())
+                            print(f"    \033[32m✓\033[0m Loaded skill: {skill_file}  ({toks:,} tokens)")
+                        print(f"\n{token_bar(history_tokens(history), MAX_TOKENS)}\n")
+                else:
+                    print("  Subcommands: gen, load\n")
+
+            # ── /session ──────────────────────────────────────────────────────
+            elif cmd == "/session":
+                if len(parts) < 2:
+                    print("  Subcommands: save, load, list, clear\n")
+                elif parts[1].lower() == "save":
+                    name = parts[2] if len(parts) > 2 else session_name
+                    save_session(name, history, loaded_files)
+                    session_name = name
+                    print(f"  \033[32m✓\033[0m Saved as '{name}'\n")
+                elif parts[1].lower() == "load":
+                    if len(parts) < 3:
+                        print("  Usage: /session load <name>\n")
+                    else:
+                        history.clear()
+                        loaded_files.clear()
+                        h, lf = load_session(parts[2])
+                        history.extend(h)
+                        loaded_files.extend(lf)
+                        session_name = parts[2]
+                        print(f"  Files: {len(loaded_files)}")
+                        print(f"\n{token_bar(history_tokens(history), MAX_TOKENS)}\n")
+                elif parts[1].lower() == "list":
+                    sessions = list_sessions()
+                    if sessions:
+                        print("\n  Saved sessions:")
+                        for s in sessions:
+                            marker = "  \033[32m*\033[0m" if s == session_name else "   "
+                            print(f"{marker} {s}")
+                    else:
+                        print("  No saved sessions.")
+                    print()
+                elif parts[1].lower() == "clear":
+                    if len(parts) < 3:
+                        print("  Usage: /session clear <name>\n")
+                    else:
+                        p = session_path(parts[2])
+                        if p.exists():
+                            p.unlink()
+                            print(f"  \033[32m✓\033[0m Deleted session '{parts[2]}'\n")
+                        else:
+                            print(f"  Session '{parts[2]}' not found.\n")
+                else:
+                    print("  Subcommands: save, load, list, clear\n")
+
+            else:
+                print(f"  Unknown command: {cmd}  (type /help)\n")
+
+            continue
+
+        # ── Regular message ───────────────────────────────────────────────────
+        used = history_tokens(history)
+        if used + RESPONSE_RESERVE >= MAX_TOKENS:
+            print(f"\n  \033[31m⚠\033[0m Context window full. Use /reset to start fresh.\n")
+            continue
+
+        try:
+            chat_stream(client, history, user_input)
+        except Exception as e:
+            print(f"\n  \033[31m[API error]\033[0m {e}\n")
+            if history and history[-1]["role"] == "user":
+                history.pop()
+            continue
+
+        print(f"{token_bar(history_tokens(history), MAX_TOKENS)}\n")
+
+if __name__ == "__main__":
+    main()
