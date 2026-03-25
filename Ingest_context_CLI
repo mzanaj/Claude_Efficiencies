@@ -1,0 +1,216 @@
+#!/usr/bin/env python3
+"""
+code_chat.py — Chat with an LLM about your code via CLI.
+Usage: python code_chat.py [file_or_dir ...]
+"""
+
+import os
+import sys
+import textwrap
+from openai import OpenAI
+
+# ── Config ────────────────────────────────────────────────────────────────────
+MODEL = "gpt-4o"
+MAX_TOKENS = 128_000          # context window ceiling for gpt-4o
+WARN_THRESHOLD = 0.80         # warn when 80% full
+RESPONSE_TOKENS = 2_048       # reserved for the model's reply
+
+SKIP_DIRS  = {".git", "__pycache__", "node_modules", ".venv", "venv", ".mypy_cache", "dist", "build"}
+SKIP_EXTS  = {".pyc", ".pyo", ".pyd", ".so", ".dll", ".exe", ".bin",
+              ".jpg", ".jpeg", ".png", ".gif", ".svg", ".ico",
+              ".zip", ".tar", ".gz", ".lock", ".map"}
+
+# Rough token estimator (1 token ≈ 4 chars)
+def estimate_tokens(text: str) -> int:
+    return max(1, len(text) // 4)
+
+# ── File loading ──────────────────────────────────────────────────────────────
+def load_code_context(paths: list[str]) -> tuple[str, list[str]]:
+    """Return (formatted context string, list of loaded file paths)."""
+    blocks, loaded = [], []
+    for path in paths:
+        if os.path.isfile(path):
+            _read_file(path, blocks, loaded)
+        elif os.path.isdir(path):
+            for root, dirs, files in os.walk(path):
+                dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+                for fname in sorted(files):
+                    fpath = os.path.join(root, fname)
+                    _read_file(fpath, blocks, loaded)
+        else:
+            print(f"  [!] Path not found: {path}")
+    return "\n\n".join(blocks), loaded
+
+def _read_file(fpath: str, blocks: list, loaded: list):
+    if any(fpath.endswith(ext) for ext in SKIP_EXTS):
+        return
+    try:
+        with open(fpath, encoding="utf-8", errors="ignore") as f:
+            content = f.read()
+        if content.strip():
+            ext = os.path.splitext(fpath)[1].lstrip(".")
+            blocks.append(f"### {fpath}\n```{ext}\n{content}\n```")
+            loaded.append(fpath)
+    except Exception as e:
+        print(f"  [!] Could not read {fpath}: {e}")
+
+# ── Token display ─────────────────────────────────────────────────────────────
+def token_bar(used: int, total: int) -> str:
+    pct = used / total
+    filled = int(pct * 20)
+    bar = "█" * filled + "░" * (20 - filled)
+    warn = "  ⚠ nearing limit" if pct >= WARN_THRESHOLD else ""
+    return f"[{bar}] {used:,} / {total:,} tokens (~{pct*100:.0f}%){warn}"
+
+def history_tokens(history: list[dict]) -> int:
+    return sum(estimate_tokens(m["content"]) for m in history)
+
+# ── Core chat ─────────────────────────────────────────────────────────────────
+def chat(client: OpenAI, history: list[dict], user_input: str) -> str:
+    history.append({"role": "user", "content": user_input})
+    response = client.chat.completions.create(
+        model=MODEL,
+        max_tokens=RESPONSE_TOKENS,
+        messages=history,
+    )
+    reply = response.choices[0].message.content
+    history.append({"role": "assistant", "content": reply})
+    return reply
+
+def ingest(history: list[dict], paths: list[str]) -> list[str]:
+    """Load code into history, return list of loaded files."""
+    context, loaded = load_code_context(paths)
+    if not loaded:
+        print("  [!] No files loaded.")
+        return []
+    history.append({"role": "user",    "content": f"Here is my current codebase:\n\n{context}"})
+    history.append({"role": "assistant","content": "Got it — I've read your code. What would you like to know?"})
+    return loaded
+
+# ── Help text ─────────────────────────────────────────────────────────────────
+HELP = textwrap.dedent("""\
+    Commands (type at the prompt):
+      /load <path> [path2 ...]  — ingest (or re-ingest) files/dirs into context
+      /reset                    — clear all history and start fresh
+      /reset <path> [...]       — clear history, then immediately load new paths
+      /tokens                   — show current token usage
+      /files                    — list currently loaded files
+      /help                     — show this message
+      /quit  or  /exit          — exit
+""")
+
+# ── Main loop ─────────────────────────────────────────────────────────────────
+def main():
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        print("Error: OPENAI_API_KEY environment variable not set.")
+        sys.exit(1)
+
+    client = OpenAI(api_key=api_key)
+    history: list[dict] = []
+    loaded_files: list[str] = []
+
+    print("╔══════════════════════════════════════╗")
+    print("║         code_chat  — LLM CLI         ║")
+    print("╚══════════════════════════════════════╝")
+    print(f"  Model : {MODEL}")
+    print(f"  Type /help for commands\n")
+
+    # Pre-load any paths passed as CLI args
+    if len(sys.argv) > 1:
+        paths = sys.argv[1:]
+        print(f"  Loading {len(paths)} path(s)…")
+        loaded_files = ingest(history, paths)
+        for f in loaded_files:
+            print(f"    ✓ {f}")
+        used = history_tokens(history)
+        print(f"\n  {token_bar(used, MAX_TOKENS)}\n")
+
+    while True:
+        try:
+            user_input = input("you> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nBye!")
+            break
+
+        if not user_input:
+            continue
+
+        # ── Commands ──────────────────────────────────────────────────────────
+        if user_input.startswith("/"):
+            parts = user_input.split()
+            cmd   = parts[0].lower()
+
+            if cmd in ("/quit", "/exit"):
+                print("Bye!")
+                break
+
+            elif cmd == "/help":
+                print(HELP)
+
+            elif cmd == "/tokens":
+                used = history_tokens(history)
+                print(f"  {token_bar(used, MAX_TOKENS)}\n")
+
+            elif cmd == "/files":
+                if loaded_files:
+                    print("  Loaded files:")
+                    for f in loaded_files:
+                        print(f"    • {f}")
+                else:
+                    print("  No files loaded yet.")
+                print()
+
+            elif cmd == "/reset":
+                history.clear()
+                loaded_files.clear()
+                print("  ✓ History cleared.\n")
+                if len(parts) > 1:
+                    paths = parts[1:]
+                    print(f"  Loading {len(paths)} path(s)…")
+                    loaded_files = ingest(history, paths)
+                    for f in loaded_files:
+                        print(f"    ✓ {f}")
+                    used = history_tokens(history)
+                    print(f"\n  {token_bar(used, MAX_TOKENS)}\n")
+
+            elif cmd == "/load":
+                if len(parts) < 2:
+                    print("  Usage: /load <path> [path2 ...]\n")
+                else:
+                    paths = parts[1:]
+                    print(f"  Loading {len(paths)} path(s)…")
+                    new_files = ingest(history, paths)
+                    loaded_files.extend(new_files)
+                    for f in new_files:
+                        print(f"    ✓ {f}")
+                    used = history_tokens(history)
+                    print(f"\n  {token_bar(used, MAX_TOKENS)}\n")
+
+            else:
+                print(f"  Unknown command: {cmd}  (type /help)\n")
+
+            continue
+
+        # ── Regular message ───────────────────────────────────────────────────
+        used_before = history_tokens(history)
+        if used_before + RESPONSE_TOKENS >= MAX_TOKENS:
+            print("  ⚠ Context window nearly full. Use /reset to start fresh.\n")
+            continue
+
+        try:
+            reply = chat(client, history, user_input)
+        except Exception as e:
+            print(f"  [API error] {e}\n")
+            # Remove the user turn we just appended so history stays clean
+            if history and history[-1]["role"] == "user":
+                history.pop()
+            continue
+
+        print(f"\nllm> {reply}\n")
+
+        used = history_tokens(history)
+        print(f"     {token_bar(used, MAX_TOKENS)}\n")
+
+if __name__ == "__main__":
+    main()
