@@ -1,0 +1,267 @@
+#!/usr/bin/env python3
+"""
+code_chat.py — Chat with an LLM about your code via CLI (Improved)
+Usage: python code_chat.py [file_or_dir ...]
+"""
+import os
+import sys
+import textwrap
+import subprocess
+from openai import OpenAI
+from dotenv import load_dotenv
+import tiktoken
+
+# ── Config ────────────────────────────────────────────────────────────────────
+load_dotenv()  # Load from .env if present
+
+MODEL = "gpt-4o"
+MAX_TOKENS = 128_000
+WARN_THRESHOLD = 0.80
+RESPONSE_TOKENS = 2_048
+
+SKIP_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv", ".mypy_cache", "dist", "build", ".pytest_cache"}
+SKIP_EXTS = {".pyc", ".pyo", ".pyd", ".so", ".dll", ".exe", ".bin", ".jpg", ".jpeg", ".png", ".gif", ".svg", ".ico", ".zip", ".tar", ".gz", ".lock", ".map"}
+
+# Tiktoken for accurate token counting
+try:
+    enc = tiktoken.encoding_for_model(MODEL)
+except Exception:
+    enc = tiktoken.get_encoding("cl100k_base")
+
+
+def estimate_tokens(text: str) -> int:
+    return len(enc.encode(text, disallowed_special=()))
+
+
+# ── Git + File loading ────────────────────────────────────────────────────────
+def load_code_context(paths: list[str]) -> tuple[str, list[str]]:
+    """Return (formatted context string, list of loaded file paths)."""
+    blocks = []
+    loaded = []
+
+    for path in paths:
+        path = os.path.abspath(path)
+        if os.path.isfile(path):
+            _read_file(path, blocks, loaded)
+        elif os.path.isdir(path):
+            # Try using git ls-files first (best for respecting .gitignore)
+            files = _get_git_tracked_files(path)
+            if files:
+                for fpath in sorted(files):
+                    _read_file(fpath, blocks, loaded)
+            else:
+                # Fallback to os.walk
+                for root, dirs, files in os.walk(path):
+                    dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+                    for fname in sorted(files):
+                        fpath = os.path.join(root, fname)
+                        _read_file(fpath, blocks, loaded)
+        else:
+            print(f" [!] Path not found: {path}")
+
+    return "\n\n".join(blocks), loaded
+
+
+def _get_git_tracked_files(root_dir: str) -> list[str]:
+    """Use git ls-files to respect .gitignore - returns absolute paths."""
+    try:
+        result = subprocess.check_output(
+            ['git', 'ls-files', '--cached', '--others', '--exclude-standard'],
+            cwd=root_dir,
+            text=True,
+            stderr=subprocess.DEVNULL
+        )
+        rel_files = [f.strip() for f in result.splitlines() if f.strip()]
+        return [os.path.join(root_dir, f) for f in rel_files]
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return []  # Not a git repo or git not available
+
+
+def _read_file(fpath: str, blocks: list, loaded: list):
+    if any(fpath.endswith(ext) for ext in SKIP_EXTS):
+        return
+    try:
+        with open(fpath, encoding="utf-8", errors="ignore") as f:
+            content = f.read()
+        if content.strip():
+            ext = os.path.splitext(fpath)[1].lstrip(".") or "text"
+            blocks.append(f"### {fpath}\n```{ext}\n{content}\n```")
+            loaded.append(fpath)
+    except Exception as e:
+        print(f" [!] Could not read {fpath}: {e}")
+
+
+# ── Token display ─────────────────────────────────────────────────────────────
+def token_bar(used: int, total: int) -> str:
+    pct = used / total
+    filled = int(pct * 30)
+    bar = "█" * filled + "░" * (30 - filled)
+    remaining = total - used
+    warn = " ⚠ NEARING LIMIT" if pct >= WARN_THRESHOLD else ""
+    return f"[{bar}] {used:,}/{total:,} (~{pct*100:.0f}%) | {remaining:,} left{warn}"
+
+
+def history_tokens(history: list[dict]) -> int:
+    return sum(estimate_tokens(m["content"]) for m in history)
+
+
+# ── Core functions ────────────────────────────────────────────────────────────
+def ingest(history: list[dict], paths: list[str]) -> list[str]:
+    """Load/replace code context in history."""
+    context, loaded = load_code_context(paths)
+    if not loaded:
+        print(" [!] No files loaded.")
+        return []
+
+    # Remove previous codebase block if it exists
+    i = 0
+    while i < len(history):
+        if history[i]["role"] == "user" and "Here is my current codebase:" in history[i]["content"]:
+            history.pop(i)
+            if i < len(history) and history[i]["role"] == "assistant" and "Got it" in history[i]["content"]:
+                history.pop(i)
+            continue
+        i += 1
+
+    # Insert fresh codebase
+    history.append({"role": "user", "content": f"Here is my current codebase:\n\n{context}"})
+    history.append({"role": "assistant", "content": "Got it — I've read your updated code. What would you like to know or do?"})
+
+    return loaded
+
+
+def chat(client: OpenAI, history: list[dict], user_input: str) -> str:
+    history.append({"role": "user", "content": user_input})
+    response = client.chat.completions.create(
+        model=MODEL,
+        max_tokens=RESPONSE_TOKENS,
+        messages=history,
+    )
+    reply = response.choices[0].message.content
+    history.append({"role": "assistant", "content": reply})
+    return reply
+
+
+# ── Help ──────────────────────────────────────────────────────────────────────
+HELP = textwrap.dedent("""\
+    Commands:
+      /load <path> [path...]   - Load/replace codebase (respects .gitignore)
+      /reset                   - Clear conversation
+      /reset <path> [...]      - Clear + load new codebase
+      /tokens                  - Show token usage
+      /files                   - List loaded files
+      /help                    - This message
+      /quit or /exit           - Exit
+""")
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+def main():
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        print("Error: OPENAI_API_KEY not found in environment or .env file.")
+        sys.exit(1)
+
+    client = OpenAI(api_key=api_key)
+    history: list[dict] = []
+    loaded_files: list[str] = []
+
+    print("╔════════════════════════════════════════════╗")
+    print("║         code_chat  —  Improved             ║")
+    print("╚════════════════════════════════════════════╝")
+    print(f" Model : {MODEL}")
+    print(" Uses tiktoken + .gitignore support\n")
+    print(" Type /help for commands\n")
+
+    # Pre-load CLI arguments
+    if len(sys.argv) > 1:
+        paths = sys.argv[1:]
+        print(f" Loading {len(paths)} path(s)...")
+        loaded_files = ingest(history, paths)
+        for f in loaded_files[:15]:
+            print(f" ✓ {f}")
+        if len(loaded_files) > 15:
+            print(f" ... and {len(loaded_files)-15} more")
+        used = history_tokens(history)
+        print(f"\n {token_bar(used, MAX_TOKENS)}\n")
+
+    while True:
+        try:
+            user_input = input("you> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nBye!")
+            break
+        if not user_input:
+            continue
+
+        # Commands
+        if user_input.startswith("/"):
+            parts = user_input.split()
+            cmd = parts[0].lower()
+
+            if cmd in ("/quit", "/exit"):
+                print("Bye!")
+                break
+            elif cmd == "/help":
+                print(HELP)
+            elif cmd == "/tokens":
+                used = history_tokens(history)
+                print(f" {token_bar(used, MAX_TOKENS)}\n")
+            elif cmd == "/files":
+                if loaded_files:
+                    print(" Loaded files:")
+                    for f in loaded_files:
+                        print(f" • {f}")
+                else:
+                    print(" No files currently loaded.")
+                print()
+            elif cmd == "/reset":
+                history.clear()
+                loaded_files.clear()
+                print(" ✓ History and context cleared.")
+                if len(parts) > 1:
+                    paths = parts[1:]
+                    print(f" Loading {len(paths)} path(s)...")
+                    loaded_files = ingest(history, paths)
+                    for f in loaded_files[:12]:
+                        print(f" ✓ {f}")
+                    if len(loaded_files) > 12:
+                        print(f" ... +{len(loaded_files)-12} more")
+                    print(f"\n {token_bar(history_tokens(history), MAX_TOKENS)}\n")
+            elif cmd == "/load":
+                if len(parts) < 2:
+                    print(" Usage: /load <path> [path2 ...]\n")
+                else:
+                    paths = parts[1:]
+                    print(f" Loading {len(paths)} path(s)... (replacing previous context)")
+                    new_files = ingest(history, paths)
+                    loaded_files = new_files[:]
+                    for f in new_files[:12]:
+                        print(f" ✓ {f}")
+                    if len(new_files) > 12:
+                        print(f" ... +{len(new_files)-12} more")
+                    print(f"\n {token_bar(history_tokens(history), MAX_TOKENS)}\n")
+            else:
+                print(f" Unknown command: {cmd} — type /help\n")
+            continue
+
+        # Regular chat message
+        used_before = history_tokens(history)
+        if used_before + RESPONSE_TOKENS + 500 >= MAX_TOKENS:
+            print(" ⚠ Context window nearly full. Consider /reset.\n")
+            continue
+
+        try:
+            reply = chat(client, history, user_input)
+            print(f"\nllm> {reply}\n")
+            used = history_tokens(history)
+            print(f" {token_bar(used, MAX_TOKENS)}\n")
+        except Exception as e:
+            print(f" [API Error] {e}")
+            if history and history[-1]["role"] == "user":
+                history.pop()
+            continue
+
+
+if __name__ == "__main__":
+    main()
