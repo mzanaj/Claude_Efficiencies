@@ -29,6 +29,7 @@ Usage:
   pip install anthropic pandas
   export ANTHROPIC_API_KEY=sk-ant-...
   python eval_harness.py --csv data.csv --run-id v7 --labeler-version prompt_v7
+  python eval_harness.py --ingest-queue eval_out/review_queue_v7.csv  # adjudications -> golden set + core
   python eval_harness.py --compare-last-two          # drift report only
 
 Prompt-change workflow: relabel your data with the new labeler prompt, rerun
@@ -465,6 +466,42 @@ def write_review_queue(res: pd.DataFrame, run_id: str) -> Path:
 
 
 # --------------------------------------------------------------------------
+# Ingest human adjudications
+# --------------------------------------------------------------------------
+def ingest_queue(queue_path: str) -> None:
+    """Read a review queue whose human_label column has been filled in, append
+    those rows to golden_set.csv (dedup by id, latest decision wins), and add
+    their ids to the fixed core so they recur — and get re-checked — every run."""
+    ensure_dirs()
+    qp = Path(queue_path)
+    if not qp.exists():
+        sys.exit(f"queue file not found: {qp}")
+    q = pd.read_csv(qp)
+    if "human_label" not in q.columns:
+        sys.exit("queue file has no human_label column")
+    q["human_label"] = q["human_label"].astype(str).str.strip().str.lower()
+    adj = q[q["human_label"].isin(CLASSES)][["id", "text", "human_label"]]
+    if adj.empty:
+        sys.exit(f"no rows with a filled human_label (must be one of: {', '.join(CLASSES)})")
+
+    if GOLDEN_PATH.exists():
+        g = pd.read_csv(GOLDEN_PATH)
+        if "id" not in g.columns:
+            g = g.copy()
+            g["id"] = g["text"].map(sha_id)
+        combined = pd.concat([g, adj], ignore_index=True)
+    else:
+        combined = adj
+    combined = combined.drop_duplicates("id", keep="last")
+    combined.to_csv(GOLDEN_PATH, index=False)
+
+    core = load_fixed_core() | set(adj["id"])
+    FIXED_CORE_PATH.write_text("\n".join(sorted(core)) + "\n")
+    print(f"[ingest] {len(adj)} adjudications -> {GOLDEN_PATH} (golden set now {len(combined)} rows)")
+    print(f"[ingest] ids added to fixed core -> {FIXED_CORE_PATH} ({len(core)} ids total)")
+
+
+# --------------------------------------------------------------------------
 # Main run
 # --------------------------------------------------------------------------
 def run(args) -> None:
@@ -546,8 +583,13 @@ def main() -> None:
     ap.add_argument("--no-cache", action="store_true")
     ap.add_argument("--compare-last-two", action="store_true",
                     help="print drift report between the two most recent runs and exit")
+    ap.add_argument("--ingest-queue", metavar="QUEUE_CSV",
+                    help="append filled human_label rows from a review queue to golden_set.csv and the fixed core, then exit")
     args = ap.parse_args()
 
+    if args.ingest_queue:
+        ingest_queue(args.ingest_queue)
+        return
     if args.compare_last_two:
         compare_last_two()
         return
