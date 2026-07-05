@@ -1,5 +1,21 @@
 #!/usr/bin/env python3
 """
+# one-time setup
+pip install anthropic pandas
+export ANTHROPIC_API_KEY=sk-ant-...
+# edit judge_rubric_v1.md for your domain; set JUDGE_MODEL in the config block
+
+# 1. evaluate a labeled CSV (samples fixed core + fresh, blind-judges, prints report)
+python eval_harness.py --csv data.csv --run-id v8 --labeler-version prompt_v8
+
+# 2. adjudicate: fill the human_label column in eval_out/review_queue_v8.csv
+
+# 3. ingest your decisions (-> golden_set.csv + fixed core; auto-used next run)
+python eval_harness.py --ingest-queue eval_out/review_queue_v8.csv
+
+# 4. after a prompt change + relabel + new run: diff the last two runs
+python eval_harness.py --compare-last-two
+
 eval_harness.py — QA harness for LLM-produced training labels.
 
 Design (blind re-annotation, not verification):
