@@ -1,0 +1,89 @@
+Architected comprehensive Docker deployment strategy with security layers and port mappingArchitected comprehensive Docker deployment strategy with security layers and port mappingHere's the complete, verified-at-every-step guide. First, get the picture and the port map straight, because every mistake in this setup is a port/host mistake.
+The architecture (fictitious example values used throughout)
+Customer's browser                    YOUR SERVER (one machine)
+─────────────────                ─────────────────────────────────────
+http://chat.acme-corp.com:8443 ──►  Open WebUI container (listens 8080 inside,
+        (public)                     published on 0.0.0.0:8443)
+                                            │
+                                            ▼
+                                     Hermes API server
+                                     127.0.0.1:8642  (PRIVATE — localhost only)
+WhatHostPortWho can reach itHermes API127.0.0.1 (localhost only)8642Only the UI container. Never expose this — it has no authentication.Open WebUI0.0.0.0 (all interfaces)8443 (your public port; pick yours)CustomersPublic linkchat.acme-corp.com → 203.0.113.508443Customers
+Replace 8443, chat.acme-corp.com, and 203.0.113.50 with your real port, link, and server IP everywhere below.
+
+Step 1 — Configure and start Hermes
+Edit ~/.hermes/.env and make sure it contains:
+bashAPI_SERVER_ENABLED=true
+Start it:
+bashhermes gateway
+Verify (don't skip):
+bashcurl http://127.0.0.1:8642/v1/models
+You should get JSON listing model(s). If connection refused: the gateway isn't running or the API server flag isn't set — check hermes doctor and the gateway startup logs for which port it actually bound.
+⚠️ Security check: confirm Hermes is NOT reachable from outside:
+bashss -tlnp | grep 8642
+You want to see 127.0.0.1:8642, not 0.0.0.0:8642. If it shows 0.0.0.0, find the bind/host setting in Hermes's config and set it to 127.0.0.1 — otherwise customers could hit your agent directly, bypassing all UI logins.
+Step 2 — Load the Open WebUI image (offline)
+bashdocker load -i openwebui-image.tar
+Verify:
+bashdocker images | grep open-webui
+Step 3 — Run the container
+bashdocker run -d \
+  --name open-webui \
+  -p 0.0.0.0:8443:8080 \
+  --add-host=host.docker.internal:host-gateway \
+  -v open-webui-data:/app/backend/data \
+  -e OPENAI_API_BASE_URL=http://host.docker.internal:8642/v1 \
+  -e OPENAI_API_KEY=not-needed \
+  -e ENABLE_OLLAMA_API=false \
+  -e OFFLINE_MODE=true \
+  -e HF_HUB_OFFLINE=1 \
+  -e ENABLE_VERSION_UPDATE_CHECK=false \
+  -e WEBUI_URL=http://chat.acme-corp.com:8443 \
+  --restart unless-stopped \
+  ghcr.io/open-webui/open-webui:main
+Every setting explained — these are exactly the "obvious settings" you asked me to surface:
+
+-p 0.0.0.0:8443:8080 — the customer-facing connection point. The UI listens on 8080 inside the container; this publishes it on your server's port 8443, on all network interfaces. Change 8443 to whatever port you've exposed; never change the 8080.
+--add-host=host.docker.internal:host-gateway — creates a hostname inside the container that points back to your host machine. Required on Linux; without it the next line fails.
+OPENAI_API_BASE_URL=http://host.docker.internal:8642/v1 — the UI→Hermes connection point. Note it is NOT localhost — inside a container, localhost means the container itself, not your machine. This is the single most common mistake in this entire setup.
+-v open-webui-data:... — customer accounts and chat history live here. Survives restarts/upgrades.
+WEBUI_URL — set to your real public link; the UI uses it for generated links.
+--restart unless-stopped — auto-recovers after reboot.
+The offline vars prevent startup hangs trying to reach the internet.
+
+Verify, layer by layer:
+bashdocker logs -f open-webui          # wait for "Uvicorn running on http://0.0.0.0:8080"; Ctrl+C to exit logs
+
+# Container can reach Hermes? (the critical link)
+docker exec open-webui curl -s http://host.docker.internal:8642/v1/models
+
+# UI reachable locally on the public port?
+curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8443    # expect 200
+Step 4 — Open the door for customers
+Allow your public port through the firewall (Ubuntu example):
+bashsudo ufw allow 8443/tcp
+Do not add any rule for 8642. If you're behind a cloud provider or corporate firewall, the same rule (allow TCP 8443 inbound) goes in that security group too, and your DNS entry chat.acme-corp.com → 203.0.113.50 must exist.
+Verify from a DIFFERENT machine (your laptop, a customer's network):
+bashcurl -s -o /dev/null -w "%{http_code}\n" http://chat.acme-corp.com:8443
+Expect 200. If it times out here but Step 3's local curl worked, the problem is 100% firewall/DNS, not the app.
+Step 5 — First login and locking it down for customers
+
+Open http://chat.acme-corp.com:8443 in a browser. The first account created becomes the admin — create it immediately, before sharing the link.
+Go to Admin Panel → Settings → Connections → confirm the OpenAI API connection shows your Hermes URL and is green.
+Open a new chat → the Hermes model should appear in the model dropdown → send a test message and confirm you get a reply. This proves the entire chain end-to-end.
+Now the customer-facing decisions, in Admin Panel → Settings → General:
+
+New sign-ups: leave ON if customers self-register, OFF if you create their accounts.
+Default user role: set to user (not admin!). Consider pending if you want to manually approve each signup.
+
+
+Optional but nice: Admin Panel → Settings → Models — hide any models you don't want customers selecting, set the Hermes model as default.
+
+Step 6 — Operations cheat sheet
+bashdocker logs -f open-webui        # live logs / debugging
+docker restart open-webui        # restart UI (data safe)
+docker stop open-webui           # take it down
+docker start open-webui          # bring it back
+After a server reboot: Docker restarts the UI automatically, but Hermes will not restart itself unless you've set it up as a service — so the symptom "UI loads but no models / errors on send" after a reboot almost always means "start hermes gateway again." Worth wiring Hermes into systemd if this is for real customers; say the word and I'll write that unit file.
+One important honesty note for "front-facing customers"
+This setup serves plain http. Anything customers type — including their passwords — travels unencrypted. For a real customer deployment you want https, which means putting nginx or Caddy in front (Caddy can do it in ~5 lines and handles certificates automatically, though certificate issuance needs internet — for a fully offline network you'd use an internal CA or accept http on a trusted LAN). The reverse proxy must support WebSocket upgrades since Open WebUI uses Socket.IO for streaming. If customers are on the open internet rather than an internal network, treat https as mandatory, not optional — tell me which proxy you have available and I'll give you the exact config for it.
